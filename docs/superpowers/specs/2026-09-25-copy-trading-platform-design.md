@@ -1,6 +1,6 @@
 # Broker-Neutral Copy-Trading Platform Design
 
-**Status:** Approved conversational design, consolidated for written review
+**Status:** Approved conversational design, revised after written review
 
 **Date:** 2026-09-25
 
@@ -284,6 +284,10 @@ Only one workflow may control a broker-account/instrument pair at once. The leas
 
 Account-wide safety operations take precedence by advancing the account epoch. They do not wait for narrower leases to expire.
 
+Lease acquisition locks the account/instrument ownership row, increments its fencing token, and records the current deployment generation and every applicable execution epoch. The default lease lasts five seconds and is renewed every second while its worker remains healthy. A failed renewal immediately stops further dispatch from that worker. After expiry, another worker may claim ownership only by atomically incrementing the fencing token; the prior owner can no longer persist execution state or obtain a dispatch permit.
+
+Immediately before each broker call, the worker uses a database transaction to verify the lease expiry, fencing token, deployment generation, safety state, and applicable epochs, then records a uniquely identified dispatch attempt. The network request follows that committed dispatch intent. A safety transaction that linearizes after the permit cannot retract an already-started network call, so the resulting attempt is cancelled and reconciled as described above.
+
 ## 13. Execution policy and state machine
 
 Default follower orders are marketable limit orders. Initial price-protection defaults are 25 basis points for equities, 20 basis points for futures, and 100 basis points for options, further constrained by tick size and exchange price bands. Orders have a default working TTL of two seconds and at most two cancel-and-reprice attempts. Exhaustion enters `RECONCILIATION_REQUIRED` and quarantines the account/instrument; an order is never automatically converted to an unrestricted market order.
@@ -315,6 +319,10 @@ If a future broker cannot preserve an adequate client identifier, the adapter mu
 Business mutations and their outgoing events commit in one PostgreSQL transaction through an outbox. Consumers apply an inbox receipt and business mutation atomically. Delivery is at least once; effectively-once business effects come from idempotency constraints, monotonic versions, fencing, and reconciliation.
 
 Events contain an event ID, type, schema version, tenant, aggregate identity, aggregate version, correlation and causation IDs, occurred-at time, committed-at time, and typed payload. Consumers reject unknown incompatible schema versions.
+
+Outbox publishers claim bounded batches with `FOR UPDATE SKIP LOCKED` and a 30-second database claim lease. Publishing and marking a row as published cannot be atomic with an external transport: a crash after publish but before acknowledgement deliberately causes redelivery. Consumers enforce a unique `(consumer_name, event_id)` inbox key and commit that receipt with their state mutation, making redelivery harmless.
+
+A publisher crash mid-batch leaves unpublished rows pending and claimed rows reclaimable after lease expiry. Retries begin at 250 milliseconds, double to a maximum 30 seconds, and enter an operator-visible dead-letter state after 20 failed attempts without deleting the event. Restart tests must crash publishers and consumers before and after every transaction boundary.
 
 No component claims end-to-end exactly-once broker execution.
 
@@ -414,13 +422,21 @@ All logs pass through an automated redaction interceptor. Raw object dumping, ar
 
 CI includes canary-secret tests that fail if representative secrets appear in captured logs or traces. Production logging fails closed to a minimal safe event when a payload lacks an approved schema.
 
-Personal-data notices, consent, retention, deletion, access, and incident workflows must be designed against the staged commencement dates in the Digital Personal Data Protection Rules, 2025. ICT logging and incident operations must account for applicable CERT-In directions, including secure retention requirements. Final live-service controls require legal confirmation of the platform's exact role and obligations.
+As of this specification date, the notified Digital Personal Data Protection Rules, 2025 put Rules 1, 2, and 17–21 into force on publication; Rule 4 takes effect on 13 November 2026, and Rules 3, 5–16, 22, and 23 take effect on 13 May 2027. The release checklist must revalidate these dates and any amendments against the official Gazette.
+
+Any paper pilot that onboards external people or processes real personal data is blocked until a privacy readiness review covers notice, consent or other lawful basis, purpose limitation, access, correction, erasure, retention, processor contracts, breach response, and user complaints. An internal demonstration using only synthetic identities may proceed without representing itself as an externally available pilot. Any live-money or public release additionally requires written legal confirmation of the platform's regulatory role.
+
+As of this specification date, applicable CERT-In directions require relevant ICT logs to be retained securely for a rolling 180 days within India and specified cyber incidents to be reported within six hours of noticing them. The operations milestone must implement an India-resident log archive, time synchronization, named incident contacts, a six-hour reporting runbook, and an evidence-producing incident exercise. Release review must revalidate these obligations against the current official CERT-In directions.
 
 ## 20. Auditability
 
 Audit events are append-only and include actor, tenant, action, resource, prior and resulting version references, policy version, reason, correlation ID, causation ID, request origin, authentication strength, timestamp, and outcome. Sensitive values are referenced or redacted rather than copied.
 
-Audit rows are hash-chained in committed batches. Signed batch manifests and encrypted exports are written periodically to retention-locked object storage. Verification jobs detect missing, reordered, or modified exported records. PostgreSQL alone is not described as immutable.
+Application roles receive insert and select privileges on audit rows but no update or delete privileges; database triggers reject mutation by ordinary runtime roles. Each row receives a database-generated global sequence. PostgreSQL superuser access remains a trusted administrative boundary, so PostgreSQL alone is not described as immutable.
+
+One database-elected audit exporter constructs deterministic batches from contiguous, previously unexported sequence ranges. Each signed manifest contains the first and last sequence, row count, payload Merkle root, previous manifest hash, creation time, and signing-key identifier. The exporter writes the encrypted batch and manifest to retention-locked object storage before advancing the database checkpoint. A crash retries the same deterministic batch key, so multiple workers or restarts cannot fork the chain.
+
+Committed audit events have an export-lag SLO of 60 seconds at p95 and a hard operational limit of 120 seconds. Crossing 120 seconds pages an operator; crossing five minutes automatically pauses new exposure while leaving risk-reducing actions available. An hourly incremental verifier checks sequence continuity, signatures, manifest links, and object retention state; a daily full verifier rechecks all manifests created that day. Export and verification evidence is a mandatory release artifact.
 
 ## 21. Dashboard and operator workflows
 
@@ -450,13 +466,28 @@ Structured logs, traces, metrics, and alerts use correlation IDs shared with bus
 
 Alerts are actionable and identify tenant-safe resource references, severity, current safety state, and runbook link. They exclude secrets and unnecessary personal data.
 
+The initial operational objectives are:
+
+- Eligible target commit to first broker submission: below two seconds at p95
+- Active-account reconciliation freshness while an execution is open: below one second at p95 and never intentionally scheduled beyond two seconds
+- Inactive-account snapshot freshness during a trading session: no more than 30 seconds
+- Audit export lag: below 60 seconds at p95 and no more than 120 seconds without alerting
+- Non-streaming dashboard read endpoints: below 500 milliseconds at p95 under the acceptance load
+- Safety-state visibility in the operator dashboard: below one second at p95 after database commit
+
+SLO calculations exclude planned maintenance but never exclude failures, retries, or overload. Breaches produce evidence and a remediation decision rather than silently resetting the measurement window.
+
 ## 23. Deployment and operations
 
 The initial deployment uses containers in one region with separately scalable API, trading-worker, execution-worker, reconciliation-worker, scheduler/coordinator, dashboard, PostgreSQL, Redis, and observability processes. All application processes run the same versioned release.
 
 Migrations are backward-compatible across a rolling deployment. New deployments remain execution-closed until generation fencing and boot reconciliation complete. Readiness does not imply trading readiness; the system exposes separate service-health and execution-readiness states.
 
-PostgreSQL backups are encrypted and restoration is exercised in automated operational tests. Redis backups are not required for trading correctness. Configuration and risk-policy changes are versioned, validated, and auditable.
+For the single-region paper MVP, the database recovery objectives are RPO no greater than five minutes and RTO no greater than four hours. PostgreSQL uses encrypted daily full backups plus continuous write-ahead-log archiving. A clean-room restore test runs monthly and must demonstrate both objectives and a complete audit-sequence verification. Any live-money release requires a new threat and business-impact assessment and a multi-availability-zone design; the paper-MVP objectives are not inherited automatically.
+
+Redis contains only replaceable latest-version pointers, leaky-bucket state, response caches, and coordination hints. Durable targets, policies, rate-limit configuration, epochs, leases, commands, and events remain in PostgreSQL. After total Redis loss, version pointers and caches rebuild from PostgreSQL. Machine strategy ingress fails closed until the distributed leaky bucket is available; safety commands and reconciliation remain available through PostgreSQL. Redis backups are therefore not required for trading correctness.
+
+Configuration and risk-policy changes are versioned, validated, and auditable.
 
 ## 24. Verification strategy
 
@@ -474,7 +505,10 @@ PostgreSQL backups are encrypted and restoration is exercised in automated opera
 ### 24.2 Integration testing
 
 - PostgreSQL outbox/inbox atomicity
+- Publisher crash before publish, after publish, and before the published checkpoint
+- Consumer crash before and after committing its inbox receipt
 - Competing execution workers and stale fencing tokens
+- Lease renewal failure, expiry, takeover, and stale-owner persistence rejection
 - Atomic epoch changes for every safety scope
 - Startup-generation fencing with multiple replicas
 - Redis loss, stale cache pointers, and cache recovery
@@ -499,22 +533,39 @@ PostgreSQL backups are encrypted and restoration is exercised in automated opera
 
 The acceptance profile uses 100 followers and 10 concurrent strategies with burst traffic at the ingress limits. The platform must maintain target-to-submission p95 below two seconds for eligible deltas, preserve every invariant, exhibit no cross-tenant access, and return to a reconciled state after injected failures. Endurance tests cover full simulated trading sessions and session-boundary restart/reconciliation.
 
+After passing the acceptance profile, a non-blocking capacity-characterization run uses 1,000 followers and 100 strategies. It does not impose the MVP SLO at that scale; it records saturation points, queue growth, database contention, and the partitioning or service-extraction work required before claiming support. No 10,000-follower capability is advertised without a separately approved scale plan and measured test evidence.
+
 ## 25. Delivery boundaries
 
 The design decomposes into these testable capability milestones:
 
-1. Core types, canonical instruments, state machines, and durable ledger
-2. Deterministic simulated broker and failure scripting
-3. Target ingress, virtual ledgers, allocation, residuals, and account netting
-4. Risk, margin, drawdown, reservations, and safety epochs
-5. Execution orchestration, price protection, reversals, and fencing
-6. Streaming ingestion, snapshots, reconciliation, manual-trade detection, and recovery
-7. Multi-tenant API, dashboard, audit, privacy, and security controls
-8. Futures and independent single-leg option semantics
-9. Load, endurance, fault-injection, backup/restore, and security acceptance
-10. Operational runbooks and paper-pilot release
+1. **Secure foundation:** core types, state machines, tenant-context enforcement, durable ledger, append-only audit ingestion, approved logging schemas, and secret interception.
+2. **Instrument and simulation contract:** canonical equities, futures, and single-leg options plus the deterministic simulated broker and asset-specific failure scripting. This milestone exposes no path from a target to broker submission.
+3. **Durable target processing:** authenticated ingress, outbox/inbox delivery, virtual ledgers, allocation, residuals, and account netting under tenant isolation.
+4. **Risk and safety:** equity and derivative risk, IV and expiry margin behavior, drawdown, reservations, execution epochs, and safety controls. No execution command can exist without this gate.
+5. **Execution:** orchestration, marketable-limit protection, reversal phases, leases, fencing, correlation receipts, and order state machines.
+6. **Reconciliation and recovery:** streamed events, snapshots, manual-trade detection, unknown outcomes, crash recovery, and boot fencing.
+7. **Product and privacy readiness:** administrator, operator, follower, and auditor APIs and dashboards; identity lifecycle; personal-data workflows; and external-pilot privacy gate.
+8. **Audit, incident, and disaster operations:** locked audit export and verification, CERT-In-aligned retention and incident exercise, backup/restore evidence, and operator runbooks.
+9. **System acceptance:** baseline load, endurance, fault injection, security testing, SLO evidence, and 1,000-follower capacity characterization.
+10. **Paper-pilot release:** deployment rehearsal, execution-readiness review, release evidence bundle, and approval limited to the reviewed internal or external pilot scope.
 
-Each milestone must leave the repository in a demonstrably working, testable state. A separate implementation plan will define exact files, interfaces, tests, commands, and commit boundaries after this specification is approved.
+### 25.1 Milestone exit gates
+
+| Milestone | Required evidence before exit |
+|---|---|
+| 1 | Clean migrations; tenant-context tests deny missing and mismatched scopes; audit mutation is denied; canary secrets never reach captured logs or traces. |
+| 2 | One broker contract suite passes for every supported asset class and every scripted failure is reproducible from its seed; no executable target endpoint exists. |
+| 3 | Monotonic target and replay tests pass; publisher and consumer crash-boundary tests show no lost state; allocation/netting property tests preserve signed quantities and residual isolation. |
+| 4 | No execution command can be created without current risk approval and atomic reservation; IV/expiry, drawdown, stale-data, epoch, and concurrent-reservation scenarios pass. |
+| 5 | State-machine, partial-fill, cancellation, repricing, reversal, lease-expiry, and stale-fence tests pass; a small concurrent fan-out meets the two-second SLO before scale testing. |
+| 6 | Restart from every execution state converges or quarantines without duplicate exposure; manual trades and 30-second unknown outcomes enforce the specified quarantine behavior. |
+| 7 | Cross-tenant API attempts fail; step-up controls work; accessibility and role workflows pass; privacy review approves the exact pilot data scope. |
+| 8 | Audit export stays within its lag limits and verifies end to end; a clean-room restore meets RPO/RTO; incident exercise produces the required contacts, timeline, and evidence. |
+| 9 | All invariant, security, fault, baseline-load, endurance, and SLO suites pass; the capacity report records the 1,000/100 saturation behavior without making an unsupported SLA claim. |
+| 10 | Deployment and rollback rehearsals pass; boot reconciliation reaches execution-ready; release evidence is signed off by the platform safety owner and, for any external pilot, the privacy/compliance owner. |
+
+The detailed implementation plan will define exact files, interfaces, test commands, commit boundaries, and reviewer gates. The specification defines behavioral exit evidence without substituting an arbitrary global line-coverage percentage for safety-critical scenario coverage.
 
 ## 26. Future evolution
 
@@ -529,3 +580,5 @@ The boundaries intentionally permit later additions without committing the MVP t
 - AI-based analysis that can recommend risk reduction but cannot override hard limits
 
 None of these future capabilities may weaken the invariants in Section 5.
+
+Every future capability begins with an architecture decision record containing an invariant-impact matrix, threat-model delta, data/privacy impact, migration and rollback plan, and tests that prove unchanged invariants. The platform safety owner must approve the record before implementation. Any externally facing, personal-data, broker, exchange, or live-money change also requires privacy/compliance approval. CI keeps the invariant suite mandatory for every subsequent release; governance is a release gate rather than a reminder in documentation.
