@@ -1,8 +1,10 @@
 # Broker-Neutral Copy-Trading Platform Design
 
-**Status:** Approved conversational design, consolidated for written review  
-**Date:** 2026-09-25  
-**Initial operating scale:** 100 followers, 10 concurrent strategies  
+**Status:** Approved conversational design, consolidated for written review
+
+**Date:** 2026-09-25
+
+**Initial operating scale:** 100 followers, 10 concurrent strategies
 **Initial environment:** Paper trading through a deterministic simulated broker
 
 ## 1. Purpose
